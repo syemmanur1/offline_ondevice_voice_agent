@@ -6,6 +6,8 @@
 # Text query -> retrieve relevant data via Qdrant.
 # Use Agno's model to synthesize a final answer.
 # Text-to-speech the response.
+
+
 # Step-by-step implementation in Python using Agno (agentic framework) and Qdrant (vector store)
 # For answering Verizon-specific Q&A from JSON-formatted knowledge base
 
