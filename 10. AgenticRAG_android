@@ -1,0 +1,270 @@
+# Project Structure:
+
+/VoiceAgentApp
+  /app
+    MainActivity.kt (Android entry)
+    Agent.kt (core agent logic)
+    Retriever.kt (Qdrant retriever)
+    Embedder.kt (embed JSON into Qdrant)
+    agno_config.yaml (for Agno model)
+    assets/
+      vz_qa.json (sample knowledge base)
+
+# sample JSON knowledge base (assets/vz_qa.json):
+
+[
+  {
+    "question": "How do I reset my Vz phone?",
+    "answer": "To reset your Vz phone, go to Settings > System > Reset Options > Erase all data (factory reset). Follow the prompts to complete the reset."
+  },
+  {
+    "question": "Why is my Vz network connection slow?",
+    "answer": "Slow network speeds can be caused by congestion, weak signals, or network maintenance. Try restarting your device or toggling Airplane mode."
+  },
+  {
+    "question": "How do I activate eSIM on Vz?",
+    "answer": "To activate eSIM, open the Vz app, select 'Activate a device', and follow the steps to scan the eSIM QR code or download it directly."
+  }
+]
+
+# Code: MainActivity.kt
+
+package com.example.voiceagent
+
+import android.os.Bundle
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import com.example.voiceagent.Agent
+import java.util.*
+
+class MainActivity : ComponentActivity() {
+    private lateinit var tts: TextToSpeech
+    private lateinit var agent: Agent
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // Initialize TTS
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts.language = Locale.US
+            }
+        }
+
+        // Initialize the agent
+        agent = Agent(context = this)
+
+        // Set up simple UI
+        setContent {
+            // Automatically start listening once app opens
+            agent.listen { userQuery ->
+                agent.getAnswer(userQuery) { answer ->
+                    speakOut(answer)
+                }
+            }
+        }
+    }
+
+    private fun speakOut(text: String) {
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "")
+    }
+
+    override fun onDestroy() {
+        tts.shutdown()
+        super.onDestroy()
+    }
+}
+
+
+# Agent.kt (the brain)
+
+package com.example.voiceagent
+
+import android.content.Context
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.content.Intent
+import java.util.Locale
+import com.example.voiceagent.Retriever
+import ai.agno.client.AgnoClient
+
+class Agent(private val context: Context) {
+    private val retriever = Retriever(context)
+    private val agnoClient = AgnoClient.loadFromConfig(context.assets.open("agno_config.yaml"))
+    private val speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+
+    // Listen for voice input
+    fun listen(callback: (String) -> Unit) {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+        }
+
+        speechRecognizer.setRecognitionListener(object : SimpleRecognitionListener() {
+            override fun onResults(results: Bundle) {
+                val matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                matches?.firstOrNull()?.let {
+                    callback(it)
+                }
+            }
+        })
+        speechRecognizer.startListening(intent)
+    }
+
+    // Get an answer from the agent
+    fun getAnswer(userQuery: String, callback: (String) -> Unit) {
+        retriever.retrieveRelevantContext(userQuery) { contextDocs ->
+            val prompt = buildPrompt(userQuery, contextDocs)
+            val response = agnoClient.generate(prompt)
+            callback(response)
+        }
+    }
+
+    private fun buildPrompt(query: String, contextDocs: List<String>): String {
+        return """
+        You are a Verizon customer support agent. Use the following context to answer the question.
+
+        Context:
+        ${contextDocs.joinToString("\n\n")}
+
+        Question: $query
+        Answer:
+        """.trimIndent()
+    }
+}
+
+# SimpleRecognitionListener.kt (basic speech recognizer listener)
+
+package com.example.voiceagent
+
+import android.os.Bundle
+import android.speech.RecognitionListener
+
+abstract class SimpleRecognitionListener : RecognitionListener {
+    override fun onReadyForSpeech(params: Bundle?) {}
+    override fun onBeginningOfSpeech() {}
+    override fun onRmsChanged(rmsdB: Float) {}
+    override fun onBufferReceived(buffer: ByteArray?) {}
+    override fun onEndOfSpeech() {}
+    override fun onError(error: Int) {}
+    override fun onPartialResults(partialResults: Bundle?) {}
+    override fun onEvent(eventType: Int, params: Bundle?) {}
+}
+
+# Retriever.kt (Qdrant searcher)
+
+package com.example.voiceagent
+
+import android.content.Context
+import io.qdrant.client.QdrantClient
+import io.qdrant.client.model.PointStruct
+import io.qdrant.client.model.SearchPoints
+import io.qdrant.client.model.VectorParams
+import io.qdrant.client.grpc.Collections
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+
+class Retriever(private val context: Context) {
+    private val qdrant = QdrantClient(url = "http://localhost", port = 6333)
+    private val embedder = Embedder(context)
+
+    init {
+        embedder.loadAndEmbedQAs(qdrant)
+    }
+
+    fun retrieveRelevantContext(query: String, callback: (List<String>) -> Unit) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val queryVector = embedder.embedText(query)
+            val results = qdrant.search(
+                collectionName = "verizon_qa",
+                request = SearchPoints(
+                    vector = queryVector,
+                    top = 3
+                )
+            )
+            val contexts = results.map { it.payload["answer"].toString() }
+            callback(contexts)
+        }
+    }
+}
+
+
+# Embedder.kt (embedding the Q&A into Qdrant)
+
+package com.example.voiceagent
+
+import android.content.Context
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import io.qdrant.client.model.PointStruct
+import io.qdrant.client.model.CreateCollection
+import io.qdrant.client.model.VectorParams
+
+class Embedder(private val context: Context) {
+    private val jsonParser = Json { ignoreUnknownKeys = true }
+
+    @Serializable
+    data class QAEntry(val question: String, val answer: String)
+
+    // Fake embedding function (replace with proper small model later!)
+    fun embedText(text: String): List<Float> {
+        return List(512) { text.hashCode() % 100 / 100f }  // Placeholder, replace with MiniLM or SentenceTransformers on-device
+    }
+
+    fun loadAndEmbedQAs(qdrant: QdrantClient) {
+        val qaJson = context.assets.open("verizon_qa.json").bufferedReader().use { it.readText() }
+        val qaList = jsonParser.decodeFromString<List<QAEntry>>(qaJson)
+
+        // Create collection if it doesn't exist
+        qdrant.recreateCollection(
+            name = "verizon_qa",
+            vectorsConfig = VectorParams(size = 512, distance = "Cosine")
+        )
+
+        // Insert all entries
+        val points = qaList.mapIndexed { idx, entry ->
+            PointStruct(
+                id = idx,
+                vector = embedText(entry.question + " " + entry.answer),
+                payload = mapOf(
+                    "question" to entry.question,
+                    "answer" to entry.answer
+                )
+            )
+        }
+
+        qdrant.upsert("verizon_qa", points)
+    }
+}
+
+# Agno config (agno_config.yaml)
+model:
+  path: /path/to/your/local/agno-model
+  quantization: int8
+  max_tokens: 512
+runtime:
+  device: auto
+
+Notes:
+# Agno: Assumes you're running a small LLM model fine-tuned for support dialogue locally.
+# Embeddings: Use a lightweight mobile-optimized model like MiniLM, MobileBERT, or simple custom hash for now.
+# Qdrant: Must run a local server, or embedded Qdrant if you compile it into Android (possible using Rust).
+# Speech: Android's native SpeechRecognizer and TextToSpeech APIs.
+# RAG: Retrieval+generation combined neatly: query -> fetch context -> generate response.
+
+
+# Future optimizations
+# Replace fake embeddings with real mobile embeddings.
+# On-device TTS (Orpheus) and ASR (wav2vec 2.0) if you want everything totally offline.
+# Use qdrant-android SDK if you need a more embedded experience.
+# Compress knowledge base (1000+ Q&A).
+
+
+
+
+

@@ -1,0 +1,90 @@
+#Since Gemma (LLM) and Coqui TTS aren’t natively supported in Android, we’ll:
+
+#Run Gemma and Coqui TTS on-device using TFLite or GGUF+JNI for LLM, and Coqui TTS TFLite (if you converted it) or stream from a native LibTorch binary.
+
+#Pipe: Mic → ASR → Tokenizer → LLM → TTS → AudioPlayer
+
+#1. ASR (Already Done - see #5 replace Whisper with TFLite ASR)
+Use runASR() to get text input from the mic.
+
+#2. LLM Inference
+#If you're using Gemma via GGUF or TFLite:
+#For Gemma GGUF, use llama.cpp Android port with JNI (works well).
+#For Gemma TFLite, convert and quantize (as in #2 sample Gemma inference).
+
+fun runGemma(prompt: String, tokenizer: Tokenizer): String {
+    val inputIds = tokenizer.encode(prompt)
+    val inputArray = Array(1) { inputIds.toIntArray() }
+
+    val outputArray = Array(1) { IntArray(256) } // up to 256 tokens out
+    val interpreter = Interpreter(loadModelFile(context, "gemma.tflite"))
+    interpreter.run(inputArray, outputArray)
+
+    return tokenizer.decode(outputArray[0])
+}
+
+# 3. Text Tokenizer (for Gemma)
+class Tokenizer(private val vocab: Map<String, Int>, private val invVocab: Map<Int, String>) {
+
+    fun encode(text: String): List<Int> {
+        return text.split(" ").map { vocab[it] ?: vocab["<unk>"]!! }
+    }
+
+    fun decode(tokens: IntArray): String {
+        return tokens.mapNotNull { invVocab[it] }.joinToString(" ")
+    }
+
+    companion object {
+        fun fromAsset(context: Context, filename: String): Tokenizer {
+            val json = context.assets.open(filename).bufferedReader().use { it.readText() }
+            val map = JSONObject(json).keys().asSequence().associateWith { JSONObject(json).getInt(it) }
+            val invMap = map.entries.associate { (k, v) -> v to k }
+            return Tokenizer(map, invMap)
+        }
+    }
+}
+
+# 4. TTS Output (Coqui)
+# Use Coqui TTS ported to TFLite or integrate native playback using MediaPlayer:
+
+fun speakText(text: String) {
+    val ttsModel = Interpreter(loadModelFile(context, "coqui_tts.tflite"))
+    val inputIds = ttsTokenizer.encode(text)
+    val inputArray = Array(1) { inputIds.toIntArray() }
+
+    val output = Array(1) { FloatArray(24000) }  // or your model's shape
+    ttsModel.run(inputArray, output)
+
+    val pcmData = output[0].map { (it * Short.MAX_VALUE).toInt().toShort() }.toShortArray()
+    val audioTrack = AudioTrack(
+        AudioManager.STREAM_MUSIC,
+        22050,
+        AudioFormat.CHANNEL_OUT_MONO,
+        AudioFormat.ENCODING_PCM_16BIT,
+        pcmData.size * 2,
+        AudioTrack.MODE_STATIC
+    )
+    audioTrack.write(pcmData, 0, pcmData.size)
+    audioTrack.play()
+}
+
+# Full Agent Loop
+
+val tokenizer = Tokenizer.fromAsset(context, "gemma_tokenizer.json")
+
+val audio = recordAudio(5)
+val userText = runASR(audio, context)
+val prompt = "You are a Verizon assistant.\nUser: $userText\nAssistant:"
+val response = runGemma(prompt, tokenizer)
+
+speakText(response)
+
+# Step 2: Package Tokenizers for Gemma + TTS
+# We’ll need:
+# gemma_tokenizer.json – vocab + ids for LLM
+# tts_tokenizer.json – character map or phoneme mapping
+# Kotlin Tokenizer class (above) to support both
+# Store in assets/ and wrap with Tokenizer.fromAsset(...)
+
+
+

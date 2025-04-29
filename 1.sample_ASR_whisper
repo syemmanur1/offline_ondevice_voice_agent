@@ -1,0 +1,139 @@
+### 1. Install necessary libraries (only once)
+# !pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# !pip install openai-whisper
+# !pip install transformers
+# !pip install sentence-transformers
+# !pip install librosa
+
+### 2. Import modules
+import torch
+import whisper
+import librosa
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+
+### 3. Load the Whisper ASR Model
+# Choose a model size: tiny, base, small, medium, large.
+# (larger models = more accurate but slower and bigger)
+# For offline use, 'base' or 'small' are good starting points.
+whisper_model = whisper.load_model("small")
+
+
+### 4. Preprocessing function: Load & prepare audio
+def load_and_preprocess_audio(audio_path, target_sr=16000):
+    """
+    Load an audio file, resample to 16 kHz (Whisper's expected input),
+    and normalize it.
+
+    Args:
+        audio_path (str): Path to input audio file.
+        target_sr (int): Target sample rate (default 16kHz).
+
+    Returns:
+        torch.Tensor: Preprocessed audio tensor.
+    """
+    # Load audio with librosa
+    audio, sr = librosa.load(audio_path, sr=None)
+    print(f"Original sampling rate: {sr}")
+
+    # Resample if necessary
+    if sr != target_sr:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+        sr = target_sr
+        print(f"Resampled to: {sr}")
+
+    # Normalize audio
+    audio = audio / np.max(np.abs(audio))
+
+    # Convert to torch tensor
+    audio_tensor = torch.tensor(audio)
+
+    return audio_tensor
+
+
+### 5. Transcribe audio function
+def transcribe_audio(audio_tensor, model):
+    """
+    Run Whisper model on preprocessed audio.
+
+    Args:
+        audio_tensor (torch.Tensor): Preprocessed audio.
+        model (whisper.Whisper): Loaded Whisper model.
+
+    Returns:
+        str: Transcribed text.
+    """
+    print("Running ASR transcription...")
+
+    # Whisper expects numpy array
+    audio_np = audio_tensor.numpy()
+
+    # Transcribe (no language detection needed if you assume English)
+    result = model.transcribe(audio_np, language='en')
+    
+    print("Transcription complete.")
+    return result['text']
+
+
+### 6. Text embedding function (for LLM input)
+def text_to_embeddings(text, embed_model_name="sentence-transformers/all-MiniLM-L6-v2"):
+    """
+    Convert transcribed text to embeddings suitable for LLM input or indexing.
+
+    Args:
+        text (str): Transcribed text.
+        embed_model_name (str): Name of embedding model (default: MiniLM).
+
+    Returns:
+        np.ndarray: Text embeddings.
+    """
+    print(f"Generating embeddings with model {embed_model_name}...")
+
+    embedder = SentenceTransformer(embed_model_name)
+    embeddings = embedder.encode(text)
+
+    print("Embeddings generated.")
+    return embeddings
+
+
+### 7. Full ASR + Embedding Pipeline
+def audio_to_embeddings_pipeline(audio_path):
+    """
+    Full pipeline from audio file to embeddings.
+
+    Args:
+        audio_path (str): Path to input audio file.
+
+    Returns:
+        (str, np.ndarray): (Transcribed text, Text embeddings)
+    """
+    audio_tensor = load_and_preprocess_audio(audio_path)
+    transcription = transcribe_audio(audio_tensor, whisper_model)
+    embeddings = text_to_embeddings(transcription)
+
+    return transcription, embeddings
+
+
+### 8. Example Usage
+# Provide your own audio file path here (wav/mp3/m4a etc.)
+# audio_file = "sample_customer_query.wav"
+# transcription, embeddings = audio_to_embeddings_pipeline(audio_file)
+
+# print("\nFinal Transcription:", transcription)
+# print("\nEmbeddings Shape:", embeddings.shape)
+
+### Now you can feed these embeddings to Gemma 3 or use the text directly for querying!
+
+
+#Testing the Pipeline
+#Once you've downloaded sample audio files:​
+#Place an audio file (e.g., sample.wav) in your working directory.​
+
+#Run the pipeline:​
+audio_file = "sample.wav"
+transcription, embeddings = audio_to_embeddings_pipeline(audio_file)
+print("Transcription:", transcription)
+Verify the output and ensure that the transcription aligns with the audio content.​
+
+

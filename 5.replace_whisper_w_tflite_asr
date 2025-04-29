@@ -1,0 +1,277 @@
+# Replace Whisper with TFLite ASR
+# We’ll use:
+# Local audio input
+# wav2vec2-style TFLite ASR (custom-converted)
+# Return transcribed text for the LLM
+
+# Prerequisites:
+# A TFLite model of Whisper or wav2vec2 - convert a wav2vec2 PyTorch model to TFLite using ONNX → TFLite.
+# A tokenizer (vocabulary + preprocessor) matching the model.
+
+# ASR Model Conversion Pipeline (HuggingFace → TFLite)
+
+# Install the required tools:
+pip install torch onnx onnxruntime onnxruntime-tools transformers tensorflow tensorflow-addons
+
+# Step 1: Load & Export ASR Model (Wav2Vec2) to ONNX
+  
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+import torch
+import numpy as np
+
+model_id = "facebook/wav2vec2-base-960h"
+processor = Wav2Vec2Processor.from_pretrained(model_id)
+model = Wav2Vec2ForCTC.from_pretrained(model_id)
+model.eval()
+
+# Dummy input: 1 sec of 16kHz audio (batch, length)
+dummy_input = torch.randn(1, 16000)
+
+# Export to ONNX
+torch.onnx.export(
+    model,
+    dummy_input,
+    "wav2vec2.onnx",
+    input_names=["input_values"],
+    output_names=["logits"],
+    dynamic_axes={"input_values": [1], "logits": [1]},
+    opset_version=13,
+)
+
+# Step 2: Convert ONNX to TFLite (Float32 → Float16 or Int8)
+# Convert ONNX → TF SavedModel
+# bash:
+onnx-tf convert -i wav2vec2.onnx -o wav2vec2_tf
+# If you hit issues here, you can alternatively use onnx2tf for better TFLite compatibility.
+
+  
+# Convert TF Model → TFLite (with Quantization)
+
+import tensorflow as tf
+
+converter = tf.lite.TFLiteConverter.from_saved_model("wav2vec2_tf")
+
+# Float16 quantization
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.target_spec.supported_types = [tf.float16]
+
+# For full int8 quantization, you’d add a representative dataset here
+# (only needed if you want strict int8)
+
+tflite_model = converter.convert()
+
+with open("wav2vec2_fp16.tflite", "wb") as f:
+    f.write(tflite_model)
+
+
+# Step 3: Package Tokenizer and Preprocessing
+# Save the processor config, vocab, and tokenizer:
+
+processor.save_pretrained("./asr_tokenizer")
+
+# This will give you:
+asr_tokenizer/
+├── preprocessor_config.json
+├── special_tokens_map.json
+├── tokenizer_config.json
+├── vocab.json
+
+# On Android or Python you can load this to:
+# - Normalize waveform input
+# - Convert logits to tokens
+# - Decode token IDs to text
+
+# Final Assets for Android
+# You’ll now have:
+📁 assets/
+├── wav2vec2_fp16.tflite        # Optimized TFLite model
+├── vocab.json                  # ID → token mapping
+├── preprocessor_config.json    # Normalization / sampling
+
+
+# Updated Voice Agent with TFLite ASR
+  
+import tensorflow as tf
+import numpy as np
+import librosa
+import sounddevice as sd
+from scipy.io.wavfile import write
+import os, json, tempfile
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from TTS.api import TTS
+import torch
+
+# === Load Tokenizer ===
+with open("asr_tokenizer/vocab.json", "r") as f:
+    vocab_dict = json.load(f)
+id2token = {int(k): v for k, v in vocab_dict.items()}
+def decode_tokens(token_ids):
+    return "".join([id2token.get(i, "") for i in token_ids]).replace("|", " ").strip()
+
+# === Load TFLite ASR Model ===
+interpreter = tf.lite.Interpreter(model_path="wav2vec2_fp16.tflite")
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# === Load LLM ===
+gemma_model_id = "google/gemma-1.1-2b-it"
+bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+tokenizer = AutoTokenizer.from_pretrained(gemma_model_id)
+llm = AutoModelForCausalLM.from_pretrained(gemma_model_id, device_map="auto", quantization_config=bnb_config)
+llm.eval()
+
+# === Load TTS ===
+tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=False, gpu=False)
+
+# === Utility Functions ===
+
+def record_audio(duration=5, samplerate=16000):
+    print(" Recording...")
+    audio = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1)
+    sd.wait()
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        write(f.name, samplerate, audio)
+        return f.name
+
+def preprocess_audio(audio_path):
+    waveform, _ = librosa.load(audio_path, sr=16000)
+    waveform = waveform / np.max(np.abs(waveform))
+    return np.expand_dims(waveform.astype(np.float32), axis=0)
+
+def run_asr(audio_path):
+    input_tensor = preprocess_audio(audio_path)
+    interpreter.set_tensor(input_details[0]["index"], input_tensor)
+    interpreter.invoke()
+    output = interpreter.get_tensor(output_details[0]["index"])
+    token_ids = np.argmax(output[0], axis=-1)
+    return decode_tokens(token_ids)
+
+def run_llm(prompt):
+    full_input = tokenizer(prompt, return_tensors="pt").to(llm.device)
+    with torch.no_grad():
+        output = llm.generate(**full_input, max_new_tokens=256, temperature=0.7, top_p=0.9)
+    return tokenizer.decode(output[0], skip_special_tokens=True).split("<start_of_turn>model")[-1].strip()
+
+def speak(text):
+    tts.tts_to_file(text=text, file_path="response.wav")
+    os.system("afplay response.wav" if os.name == "posix" else "start response.wav")
+
+def build_prompt(query):
+    sys_prompt = (
+        "You are a helpful Verizon assistant. Respond to customer questions about devices, connectivity, esim, settings, tips, and troubleshooting."
+    )
+    return f"{sys_prompt}\n\n<start_of_turn>user\n{query}<end_of_turn>\n<start_of_turn>model\n"
+
+# === MAIN LOOP ===
+print(" Verizon Voice Agent is listening. Say 'exit' to quit.\n")
+while True:
+    audio = record_audio()
+    user_text = run_asr(audio)
+    print(f" You said: {user_text}")
+    if "exit" in user_text.lower():
+        print(" Exiting.")
+        break
+
+    prompt = build_prompt(user_text)
+    response = run_llm(prompt)
+    print(f" Agent: {response}")
+    speak(response)
+    os.remove(audio)
+
+
+
+  
+# PART 2: Validate TFLite ASR Model with Real Audio
+# Let’s create a test runner to benchmark ASR quality:
+test_file = "sample_customer_issue.wav"  # Use your own test audio
+
+# Optionally record instead
+# test_file = record_audio()
+
+transcription = run_asr(test_file)
+print(" Transcription:", transcription)
+
+# You can also compare it with Whisper like this:
+import whisper
+whisper_model = whisper.load_model("tiny")
+print("Whisper:", whisper_model.transcribe(test_file)["text"])
+print("TFLite:", run_asr(test_file))
+
+
+# evaluating WER (word error rate) or benchmarking latency.
+# evaluate TFLite ASR model by measuring:
+# 1. WER (Word Error Rate) - Measures transcription accuracy by comparing predicted vs. reference (ground truth) text.
+# 2. Latency - Measures time taken for end-to-end inference (preprocess + run + decode) per utterance.
+
+# Install Evaluation Tools
+! pip install jiwer
+
+# WER Evaluation Code
+from jiwer import wer
+import time
+
+# === Reference Text (ground truth)
+reference_text = "i am having trouble connecting my verizon phone to the wifi"
+
+# === Inference
+start_time = time.time()
+predicted_text = run_asr("sample_customer_issue.wav")
+inference_time = time.time() - start_time
+
+# === Normalize text (optional)
+def normalize(text):
+    return text.lower().strip().replace(".", "").replace(",", "")
+
+# === Calculate WER
+error_rate = wer(normalize(reference_text), normalize(predicted_text))
+
+# === Results
+print(f"✅ Transcription: {predicted_text}")
+print(f"🎯 WER: {error_rate:.2f}")
+print(f"⚡ Latency: {inference_time:.2f} seconds")
+
+# Example Output
+Transcription: i am having trouble connecting my version phone to the wi fi
+WER: 0.14
+Latency: 0.27 seconds
+
+# A WER below 0.15 is good for production-quality voice agents.
+# Latency under 500ms is excellent for real-time applications on mobile.
+
+# Run Benchmark Over Multiple Files
+# If you have multiple test samples:
+
+ 
+test_samples = [
+    ("sample1.wav", "how do i enable hotspot on my verizon device"),
+    ("sample2.wav", "my phone is not detecting the esim"),
+    ("sample3.wav", "i can't connect to mobile data after the update"),
+]
+
+total_wer = 0
+total_time = 0
+
+for file, truth in test_samples:
+    start = time.time()
+    hyp = run_asr(file)
+    elapsed = time.time() - start
+    error = wer(normalize(truth), normalize(hyp))
+
+    print(f"🎙️ {file}")
+    print(f"🔹 Prediction: {hyp}")
+    print(f"🔹 Truth: {truth}")
+    print(f"WER: {error:.2f}, Latency: {elapsed:.2f}s\n")
+
+    total_wer += error
+    total_time += elapsed
+
+print(f"\n Avg WER: {total_wer/len(test_samples):.2f}")
+print(f" Avg Latency: {total_time/len(test_samples):.2f} s")
+
+# Use chatgpt to provide example .wav test files or synthetic samples to evaluate further.
+
+
+
+  

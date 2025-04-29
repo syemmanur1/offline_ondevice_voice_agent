@@ -1,0 +1,114 @@
+# Verizon Voice-Based Conversational Agent with RAG (Agno + Qdrant)
+# pipeline:
+# Load and index the JSON Q&A data.
+# Embed the questions/answers into Qdrant.
+# Voice input (speech-to-text).
+# Text query -> retrieve relevant data via Qdrant.
+# Use Agno's model to synthesize a final answer.
+# Text-to-speech the response.
+# Step-by-step implementation in Python using Agno (agentic framework) and Qdrant (vector store)
+# For answering Verizon-specific Q&A from JSON-formatted knowledge base
+
+# Install required packages 
+# !pip install agno qdrant-client sentence-transformers numpy
+
+import json
+from agno import Agent, Memory, Tool
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+# --- Step 1: Sample Verizon Q&A JSON Knowledge Base ---
+qa_data = [
+    {
+        "question": "How do I restart my Verizon phone?",
+        "answer": "To restart your Verizon phone, press and hold the power button until the restart option appears, then tap Restart."
+    },
+    {
+        "question": "Why is my Verizon internet not working?",
+        "answer": "Check if you're in a coverage area, restart your router, or reset network settings."
+    },
+    {
+        "question": "How do I enable 5G on my Verizon device?",
+        "answer": "Go to Settings > Connections > Mobile Networks > Network Mode and select 5G/LTE."
+    },
+    {
+        "question": "What should I do if my phone won't charge?",
+        "answer": "Try a different charger, clean the charging port, and ensure the outlet works. If the issue persists, contact support."
+    }
+]
+
+# --- Step 2: Initialize Qdrant Vector Store ---
+client = QdrantClient("localhost", port=6333)  # Ensure Qdrant is running locally or adjust for deployment
+collection_name = "verizon_qa"
+
+# Create a collection with embedding dimensions
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+embedding_dim = embedding_model.get_sentence_embedding_dimension()
+
+# Create collection (if not exists)
+client.recreate_collection(
+    collection_name=collection_name,
+    vectors_config=VectorParams(size=embedding_dim, distance=Distance.COSINE)
+)
+
+# --- Step 3: Ingest QA Pairs into Qdrant ---
+points = []
+for idx, item in enumerate(qa_data):
+    embedding = embedding_model.encode(item["question"]).tolist()
+    points.append(PointStruct(
+        id=idx,
+        vector=embedding,
+        payload=item
+    ))
+
+client.upsert(collection_name=collection_name, points=points)
+
+# --- Step 4: Define Retriever Tool Using Qdrant ---
+class QARetriever(Tool):
+    name = "verizon_qa_retriever"
+    description = "Retrieve the best-matching Verizon Q&A from the knowledge base."
+
+    def __call__(self, query: str) -> str:
+        query_vec = embedding_model.encode(query).tolist()
+        hits = client.search(
+            collection_name=collection_name,
+            query_vector=query_vec,
+            limit=1
+        )
+        if hits:
+            return hits[0].payload["answer"]
+        return "I'm sorry, I couldn't find an answer to that question."
+
+# --- Step 5: Create Agent with Memory and Tool ---
+retriever = QARetriever()
+agent = Agent(
+    memory=Memory(),
+    tools=[retriever],
+    system_message="You are a helpful Verizon customer support agent. Use the retriever tool to answer questions."
+)
+
+# --- Step 6: Sample Interaction ---
+questions = [
+    "My Verizon phone isn't charging. What should I do?",
+    "How can I turn on 5G on my phone?",
+    "I can't access the internet on Verizon. Help?"
+]
+
+for q in questions:
+    print("Q:", q)
+    print("A:", agent(q))
+    print()
+
+# --- Optional: Voice Input and Output ---
+# On Android, you would integrate this agent with your ASR (e.g., Wav2Vec2),
+# and TTS (e.g., Orpheus) pipeline for full voice support.
+# This only shows the RAG backend.
+
+# For deployment: wrap this into an Android-compatible API using FastAPI, JNI, or AIDL
+# and integrate with the offline voice pipeline.
+
+# Note: This assumes Qdrant is running locally. For Android, embed Qdrant via Lite mode (SQLite backend)
+# or run remotely if internet is permitted.
+

@@ -1,0 +1,39 @@
+# Install Coqui TTS
+pip install TTS
+
+# STEP 1: Load Coqui TTS Model (Offline)
+from TTS.api import TTS
+
+# Load a small, offline-capable English model
+tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=False, gpu=False)
+
+# You can also try a multi-speaker model like:
+tts = TTS(model_name="tts_models/en/vctk/vits", progress_bar=False, gpu=False)
+
+# STEP 2: Convert LLM Output to Audio
+
+def speak_text(text, output_path="response.wav"):
+    print("Synthesizing speech...")
+    tts.tts_to_file(text=text, file_path=output_path)
+    print(f"Audio saved to: {output_path}")
+
+
+# STEP 3: Run End-to-End Pipeline
+
+# Simulate a real conversation turn
+asr_output = "Hi, my phone isn't connecting to WiFi even though other devices are working fine. What should I do?"
+
+# Run through LLM
+response_text = generate_response(asr_output, tokenizer, model)
+print("LLM Response:", response_text)
+
+# Speak it aloud
+speak_text(response_text)
+
+# We now have:
+# Input speech (ASR from Whisper),
+# LLM response (Gemma 3),
+# Spoken reply (Coqui TTS as the voice).
+
+
+

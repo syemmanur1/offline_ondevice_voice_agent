@@ -1,0 +1,182 @@
+# Convert Coqui TTS (e.g., tts_models/en/ljspeech/tacotron2-DDC) into a TFLite model for offline Android use.
+# Export PyTorch → ONNX
+# ONNX → TFLite
+# Quantization (optional: float16 or int8)
+# Package for Android
+
+# Step 1: Install Requirements
+!pip install TTS onnx onnxruntime tf2onnx tensorflow
+
+# Step 2: Export Coqui TTS to ONNX
+
+from TTS.utils.manage import ModelManager
+from TTS.utils.synthesizer import Synthesizer
+import torch
+
+model_path = ModelManager().download_model("tts_models/en/ljspeech/tacotron2-DDC")
+synthesizer = Synthesizer(
+    tts_checkpoint=model_path["model_path"],
+    tts_config_path=model_path["config_path"]
+)
+
+# Load model and export to ONNX
+model = synthesizer.tts_model
+model.eval()
+
+# Example input
+input_text = "Welcome to Verizon support."
+input_tensor = torch.LongTensor([synthesizer.tts_model.text_to_sequence(input_text)])
+
+# Export
+torch.onnx.export(
+    model,
+    input_tensor,
+    "coqui_tts.onnx",
+    input_names=["input"],
+    output_names=["mel_output"],
+    dynamic_axes={"input": {0: "batch"}, "mel_output": {0: "batch"}},
+    opset_version=13
+)
+
+# Output: coqui_tts.onnx
+
+# Step 3: Convert ONNX → TFLite
+# First: Convert ONNX → TF SavedModel
+
+python -m tf2onnx.convert --opset 13 \
+  --onnx-file coqui_tts.onnx \
+  --output coqui_tts_tf \
+  --target tensorrt,tf \
+  --fold_const
+  
+
+# Then convert to .tflite:
+
+import tensorflow as tf
+
+converter = tf.lite.TFLiteConverter.from_saved_model("coqui_tts_tf")
+converter.optimizations = [tf.lite.Optimize.DEFAULT]  # Optional for quantization
+
+# Float16 quantization for edge
+converter.target_spec.supported_types = [tf.float16]
+tflite_model = converter.convert()
+
+# Save model
+with open("coqui_tts_fp16.tflite", "wb") as f:
+    f.write(tflite_model)
+
+# Output: coqui_tts_fp16.tflite
+
+# Step 4: Quantize to int8 (optional)
+# If you prefer full int8 quantization for speed and size (but may reduce quality):
+
+def representative_dataset_gen():
+    for _ in range(100):
+        yield [np.random.randint(0, 100, (1, 80)).astype(np.int32)]
+
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.representative_dataset = representative_dataset_gen
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+converter.inference_input_type = tf.int8
+converter.inference_output_type = tf.int8
+
+# Step 5: Package for Android
+# Put the following in assets/:
+
+assets/
+├── coqui_tts_fp16.tflite
+├── tts_tokenizer.json (char → ID)
+
+# Call it from Android as shown earlier (Interpreter(...).run(...)).
+
+# Test Before Deploying
+# a full Python test script to validate your converted Coqui TTS TFLite model (coqui_tts_fp16.tflite) locally and play back the synthesized audio.
+
+#Prerequisites
+! pip install numpy tensorflow sounddevice scipy
+
+# test_coqui_tts_tflite.py
+
+import numpy as np
+import tensorflow as tf
+import sounddevice as sd
+import json
+from scipy.io.wavfile import write
+
+# === Load TFLite model ===
+interpreter = tf.lite.Interpreter(model_path="coqui_tts_fp16.tflite")
+interpreter.allocate_tensors()
+
+# === Load tokenizer (word → ID map) ===
+with open("tts_tokenizer.json") as f:
+    tokenizer_data = json.load(f)
+
+# Reverse tokenizer for debug
+id_to_token = {v: k for k, v in tokenizer_data.items()}
+
+# === Tokenizer ===
+def tokenize(text):
+    return [tokenizer_data.get(char, tokenizer_data.get("<unk>", 0)) for char in text.lower()]
+
+# === Decode audio ===
+def postprocess_audio(output_tensor):
+    # Convert float32 [-1, 1] → int16 PCM
+    pcm = np.clip(output_tensor, -1.0, 1.0)
+    pcm = (pcm * 32767).astype(np.int16)
+    return pcm
+
+# === Inference ===
+def synthesize(text):
+    input_ids = tokenize(text)
+    input_array = np.array([input_ids], dtype=np.int32)
+
+    # Get input/output tensor details
+    input_index = interpreter.get_input_details()[0]['index']
+    output_index = interpreter.get_output_details()[0]['index']
+
+    interpreter.set_tensor(input_index, input_array)
+    interpreter.invoke()
+    output_data = interpreter.get_tensor(output_index)[0]
+
+    return postprocess_audio(output_data)
+
+# === Test ===
+if __name__ == "__main__":
+    test_text = "Welcome to Verizon support. How can I help you today?"
+
+    print("[INFO] Synthesizing...")
+    audio = synthesize(test_text)
+
+    print("[INFO] Playing audio...")
+    sd.play(audio, samplerate=22050)
+    sd.wait()
+
+    # Optional: Save to WAV file
+    write("verizon_tts_output.wav", 22050, audio)
+    print("[INFO] Saved output to verizon_tts_output.wav")
+
+
+# Required Files in Same Folder
+- coqui_tts_fp16.tflite
+- tts_tokenizer.json
+- test_coqui_tts_tflite.py
+
+# Sample Output
+[INFO] Synthesizing...
+[INFO] Playing audio...
+[INFO] Saved output to verizon_tts_output.wav
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
