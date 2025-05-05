@@ -1,0 +1,135 @@
+
+
+# Agentic RAG Pipeline for VZ Assistant
+import os
+import json
+import faiss
+import numpy as np
+from typing import List, Dict
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+
+# === Setup ===
+# Load embedding model (offline-capable)
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+# Load QA model (replace with a local model later)
+qa_model = pipeline("text-generation", model="tiiuae/falcon-7b-instruct")  # Placeholder
+
+# === Dataset Loading ===
+with open("verizon_support_dataset.json", "r") as f:
+    support_data = json.load(f)  # list of dicts with Question, Answer, Category, Subcategory
+
+# === Vector Index Creation ===
+questions = [item['Question'] for item in support_data]
+embeddings = embedder.encode(questions, convert_to_numpy=True)
+index = faiss.IndexFlatL2(embeddings.shape[1])
+index.add(embeddings)
+
+# === Retrieval Function ===
+def retrieve_context(query: str, k: int = 3) -> List[Dict]:
+    query_vec = embedder.encode([query], convert_to_numpy=True)
+    D, I = index.search(query_vec, k)
+    return [support_data[i] for i in I[0]]
+
+
+# === Reasoning Tools ===
+def check_device_model(model_name: str) -> str:
+    known_models = ["iPhone 14", "Galaxy S23", "Pixel 7"]
+    return f"Model {model_name} is supported." if model_name in known_models else "Unknown model. Please verify."
+def escalate_to_human(query: str) -> str:
+    triggers = ["not working", "still broken", "doesn't help"]
+    return "Escalation triggered." if any(t in query.lower() for t in triggers) else "No escalation needed."
+def troubleshooting_workflow(issue: str) -> str:
+    workflows = {
+        "wifi": "1. Restart your device. 2. Reset network settings. 3. Reconnect to Wi-Fi.",
+        "esim": "1. Go to Settings > Cellular. 2. Tap Add eSIM. 3. Scan Verizon QR.",
+        "battery": "1. Lower screen brightness. 2. Close unused apps. 3. Enable battery saver mode.",
+        "sim": "1. Remove and reinsert the SIM. 2. Restart device. 3. Check for SIM damage or try another SIM."
+    }
+    return workflows.get(issue.lower(), "Please specify a supported issue (wifi, esim, battery, sim).")
+def sim_status_check(sim_inserted: bool, sim_locked: bool) -> str:
+    if not sim_inserted:
+        return "No SIM detected. Please insert your SIM card."
+    elif sim_locked:
+        return "SIM is locked. Please enter your PIN or contact Verizon support."
+    return "SIM is active and functioning normally."
+def battery_diagnostics(battery_level: int, is_charging: bool) -> str:
+    if battery_level < 20 and not is_charging:
+        return "Battery is low. Please charge your device."
+    elif is_charging:
+        return f"Charging in progress. Battery at {battery_level}%."
+    return f"Battery level is {battery_level}%. All good."
+
+
+# === Main Assistant Function ===
+def answer_query(query: str, model_name: str = None, sim_inserted: bool = True, sim_locked: bool = False, battery_level: int = 100, is_charging: bool = False) -> str:
+    retrieved = retrieve_context(query)
+    context = "\n".join([f"Q: {item['Question']}\nA: {item['Answer']}" for item in retrieved])
+    prompt = f"Use the following support information to help answer the user's question.\n\n{context}\n\nUser: {query}\nAssistant:"
+    answer = qa_model(prompt, max_new_tokens=150)[0]['generated_text']
+    extra = []
+    if model_name:
+        extra.append(check_device_model(model_name))
+    extra.append(escalate_to_human(query))
+    if any(word in query.lower() for word in ["wifi", "esim", "battery", "sim"]):
+        keyword = next((kw for kw in ["wifi", "esim", "battery", "sim"] if kw in query.lower()), None)
+        if keyword:
+            extra.append(troubleshooting_workflow(keyword))
+    extra.append(sim_status_check(sim_inserted, sim_locked))
+    extra.append(battery_diagnostics(battery_level, is_charging))
+    return answer + "\n" + "\n".join(extra)
+
+
+# === Example ===
+if __name__ == "__main__":
+    user_query = "My Pixel 7 won't connect to Wi-Fi."
+    response = answer_query(user_query, model_name="Pixel 7", sim_inserted=True, sim_locked=False, battery_level=18, is_charging=False)
+    print(response)
+
+
+# Setup to run fully offline in a Python environment with a local model like TinyLLaMA or Gemma 2B/3B:
+
+# Step 1: Environment Setup
+
+# Install the needed packages (use CPU or GPU versions as appropriate):
+!pip install torch transformers sentence-transformers faiss-cpu accelerate
+
+# Optional (for better GPU use):
+!pip install bitsandbytes
+
+
+# Step 2: Download a Local Model
+# TinyLLaMA or Gemma 2B are small enough to run on most machines:
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # or "google/gemma-2b-it"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype="auto",
+    device_map="auto"  # Automatically maps to GPU/CPU
+)
+qa_model = pipeline("text-generation", model=model, tokenizer=tokenizer)
+
+# Make sure to replace the current model loading line in your RAG script with the one above.
+# If you use Gemma, the setup is almost identical, just change the model_id to "google/gemma-2b-it".
+# ---
+
+# Step 3: Optimize for Offline Use
+# Once downloaded, cache the model and tokenizer (it’s automatic), then disable internet for testing to ensure full offline capability.
+# You can also quantize the model with bitsandbytes to reduce memory usage:
+
+from transformers import BitsAndBytesConfig
+bnb_config = BitsAndBytesConfig(load_in_4bit=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    quantization_config=bnb_config,
+    device_map="auto"
+)
+
+# ---
+# Step 4: Full Offline Test
+# Run your script as normal. The pipeline will:
+# 1. Embed and search queries from your local FAISS index.
+# 2. Generate responses using your local model.
+# 3. Handle logic and tools without any cloud dependencies.
